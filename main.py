@@ -1,12 +1,43 @@
+"""FastAPI entrypoint for the local persistent KV cache.
+
+Environment variables
+----------------------
+KV_DATA_DIR                 directory holding ``wal.log`` (default ./.kvdata)
+KV_CAPACITY_PER_NAMESPACE   max live keys per namespace (default 10000)
+"""
+
+from __future__ import annotations
+
+import contextlib
+import os
+
 import uvicorn
 from fastapi import FastAPI
 
-app = FastAPI()
+from kvstore.api import create_app
+from kvstore.store import KVStore
 
 
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+def build_app() -> FastAPI:
+    data_dir = os.environ.get("KV_DATA_DIR", ".kvdata")
+    capacity = int(os.environ.get("KV_CAPACITY_PER_NAMESPACE", "10000"))
+    store = KVStore(data_dir=data_dir, capacity_per_namespace=capacity)
+
+    @contextlib.asynccontextmanager
+    async def lifespan(app: FastAPI):
+        try:
+            yield
+        finally:
+            store.close()
+
+    return create_app(store, lifespan=lifespan)
+
+
+def create_default_app() -> FastAPI:
+    return build_app()
+
+
+app = build_app()
 
 
 if __name__ == "__main__":
