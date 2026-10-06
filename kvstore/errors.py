@@ -66,6 +66,24 @@ class CorruptLogError(KVError):
         super().__init__(msg)
 
 
+class DataDirLocked(KVError):
+    """Another live process already holds the writer lock for this data dir.
+
+    Raised at open time so a second writer is rejected with a recognizable
+    error instead of two processes interleaving appends to one WAL. The lock
+    is advisory (flock) and is released automatically when the holder dies,
+    so a stale lock after kill -9 never blocks a new process.
+    """
+
+    code = "data_dir_locked"
+
+
+class StoreReadOnly(KVError):
+    """The store was opened read-only; mutations are rejected."""
+
+    code = "read_only"
+
+
 class TruncatedFrame(CorruptLogError):
     """The WAL ends with an incomplete frame (crash mid-write).
 

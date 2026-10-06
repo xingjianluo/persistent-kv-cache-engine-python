@@ -33,12 +33,18 @@ _MAX_PAYLOAD = 64 * 1024 * 1024  # sanity bound: a single 64 MiB frame max
 class WriteAheadLog:
     """File-backed ordered log of confirmed mutations."""
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, read_only: bool = False):
         self.path = path
+        self.read_only = read_only
+        self._next_seq = 1
+        if read_only:
+            # A reader must not create or modify anything: no directory, no
+            # file, and certainly no truncation during recovery.
+            self._file = open(path, "rb") if os.path.exists(path) else None
+            return
         directory = os.path.dirname(os.path.abspath(path))
         os.makedirs(directory, exist_ok=True)
         self._file = open(path, "ab+")
-        self._next_seq = 1
         # Make sure the directory entry of a brand-new WAL is durable too.
         dir_fd = os.open(directory, os.O_RDONLY)
         try:
@@ -48,6 +54,8 @@ class WriteAheadLog:
 
     @property
     def size(self) -> int:
+        if self._file is None:
+            return 0
         return self._file.tell()
 
     # ------------------------------------------------------------------ #
@@ -82,6 +90,8 @@ class WriteAheadLog:
         return self._append(OpCode.COMMIT, {})
 
     def _append(self, op: OpCode, payload_dict: dict) -> int:
+        if self.read_only or self._file is None:  # pragma: no cover - guarded by store
+            raise OSError("WAL opened read-only")
         payload = json.dumps(payload_dict, ensure_ascii=False, separators=(",", ":"))
         data = payload.encode("utf-8")
         seq = self._next_seq
@@ -104,6 +114,8 @@ class WriteAheadLog:
         :class:`CorruptLogError` and changes nothing. On success the next
         frame sequence is advanced past the last frame on disk.
         """
+        if not os.path.exists(self.path):
+            return [], None
         with open(self.path, "rb") as f:
             blob = f.read()
 
@@ -210,7 +222,15 @@ class WriteAheadLog:
     # Maintenance
     # ------------------------------------------------------------------ #
     def truncate_from(self, offset: int) -> None:
-        """Drop every byte at/after ``offset`` and fsync the new EOF."""
+        """Drop every byte at/after ``offset`` and fsync the new EOF.
+
+        ``_next_seq`` is recomputed from the surviving prefix (last frame's
+        seq + 1), never reset blindly: frames still on disk keep their
+        numbers, so later appends stay continuous and a subsequent recovery
+        sees no sequence gap.
+        """
+        if self.read_only:  # pragma: no cover - guarded by store
+            raise OSError("WAL opened read-only")
         self._file.close()
         fd = os.open(self.path, os.O_RDWR)
         try:
@@ -219,10 +239,27 @@ class WriteAheadLog:
         finally:
             os.close(fd)
         self._file = open(self.path, "ab+")
-        self._next_seq = 1
+        self._next_seq = self._scan_next_seq()
+
+    def _scan_next_seq(self) -> int:
+        """Header-only walk of the file: seq after the last complete frame."""
+        next_seq = 1
+        with open(self.path, "rb") as f:
+            while True:
+                header = f.read(HEADER_SIZE)
+                if len(header) < HEADER_SIZE:
+                    break
+                _, plen, _, seq, _ = HEADER_STRUCT.unpack(header)
+                if plen > _MAX_PAYLOAD:
+                    break
+                if len(f.read(plen)) < plen:
+                    break
+                next_seq = seq + 1
+        return next_seq
 
     def close(self) -> None:
-        if not self._file.closed:
-            self._file.flush()
-            os.fsync(self._file.fileno())
+        if self._file is not None and not self._file.closed:
+            if not self.read_only:
+                self._file.flush()
+                os.fsync(self._file.fileno())
             self._file.close()

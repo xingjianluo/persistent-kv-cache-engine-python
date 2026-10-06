@@ -34,6 +34,8 @@ _STATUS_BY_CODE = {
     "capacity_exceeded": 507,
     "corrupt_log": 500,
     "truncated_frame": 500,
+    "data_dir_locked": 409,
+    "read_only": 403,
 }
 
 
@@ -126,5 +128,14 @@ def create_app(store: KVStore, lifespan=None) -> FastAPI:
     @app.get("/v1/admin/recovery-report")
     def recovery_report():
         return store.last_recovery
+
+    @app.post("/v1/admin/compact")
+    def compact():
+        """Manually trigger one WAL compaction pass (writer mode only)."""
+        return store.compact()
+
+    @app.get("/v1/admin/compaction-report")
+    def compaction_report():
+        return {"last_compaction": store.last_compaction}
 
     return app

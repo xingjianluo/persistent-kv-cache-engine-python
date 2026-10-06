@@ -35,6 +35,7 @@ whose suffix is unconfirmed and is deterministically truncated on restart.
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 from collections.abc import Callable
@@ -42,13 +43,16 @@ from dataclasses import dataclass
 
 from .errors import (
     CapacityExceeded,
+    DataDirLocked,
     KeyDeleted,
     KeyExists,
     KeyExpired,
     KeyNotFound,
+    StoreReadOnly,
     TruncatedFrame,
     VersionMismatch,
 )
+from .lockfile import ProcessLock
 from .records import DeleteRecord, OpCode, PutRecord
 from .wal import WriteAheadLog
 
@@ -68,24 +72,61 @@ class _State:
 
 
 class KVStore:
-    """Namespaced persistent key-value cache (see module docstring)."""
+    """Namespaced persistent key-value cache (see module docstring).
+
+    ``read_only=True`` opens the data directory without the writer lock and
+    without ever modifying it (no lock file, no truncation, no compaction);
+    mutations are rejected with :class:`StoreReadOnly`. ``compact_on_startup``
+    runs one compaction pass right after recovery (writer mode only).
+    """
 
     def __init__(
         self,
         data_dir: str,
         capacity_per_namespace: int = 10_000,
         clock_ms: Callable[[], int] | None = None,
+        read_only: bool = False,
+        compact_on_startup: bool = False,
     ):
         if capacity_per_namespace < 1:
             raise ValueError("capacity_per_namespace must be >= 1")
         self.data_dir = str(data_dir)
         self.capacity_per_namespace = capacity_per_namespace
         self.clock_ms = clock_ms or _now_ms
+        self.read_only = read_only
         # namespace -> key -> state
         self._tables: dict[str, dict[str, _State]] = {}
         self._lock = threading.RLock()
-        self.wal = WriteAheadLog(f"{self.data_dir.rstrip('/')}/{WAL_NAME}")
-        self.last_recovery = self.recover()
+        # While a compaction is copying the snapshot, confirmed mutations
+        # are mirrored here so they can be carried into the new log.
+        self._compaction_delta: list[dict] | None = None
+        self._lockfile: ProcessLock | None = None
+        self.wal: WriteAheadLog | None = None
+        if not read_only:
+            # Single-writer rule: a second writer on the same directory is
+            # rejected with DataDirLocked before touching anything.
+            self._lockfile = ProcessLock(self.data_dir)
+            self._lockfile.acquire()
+        try:
+            wal_path = f"{self.data_dir.rstrip('/')}/{WAL_NAME}"
+            if not read_only:
+                # A leftover compact file means a crash interrupted a
+                # compaction before its atomic swap: the old WAL is still
+                # authoritative, so the copy is discarded.
+                from .compact import discard_stale_compact
+
+                discard_stale_compact(wal_path)
+            self.wal = WriteAheadLog(wal_path, read_only=read_only)
+            self.last_recovery = self.recover()
+            self.last_compaction: dict | None = None
+            if compact_on_startup and not read_only:
+                self.compact()
+        except BaseException:
+            if self.wal is not None:
+                self.wal.close()
+            if self._lockfile is not None:
+                self._lockfile.release()
+            raise
 
     # ------------------------------------------------------------------ #
     # Lifecycle / recovery
@@ -113,10 +154,15 @@ class KVStore:
                     )
 
             if truncation is not None:
-                self.wal.truncate_from(truncation.position)
-                frames, second = self.wal.recover()
-                if second is not None:  # pragma: no cover - defensive
-                    raise second
+                if self.read_only:
+                    # A reader never modifies the file: replay only the
+                    # confirmed prefix; the suffix is reported, not removed.
+                    frames = [f for f in frames if f.offset < truncation.position]
+                else:
+                    self.wal.truncate_from(truncation.position)
+                    frames, second = self.wal.recover()
+                    if second is not None:  # pragma: no cover - defensive
+                        raise second
 
             self._tables = {}
             tx_records: list = []
@@ -143,6 +189,7 @@ class KVStore:
                     "reason": truncation.reason,
                     "offset": truncation.position,
                     "detail": str(truncation).split(": ", 1)[-1],
+                    "repaired": not self.read_only,
                 },
                 "namespaces": len(self._tables),
                 "entries": sum(len(t) for t in self._tables.values()),
@@ -164,7 +211,37 @@ class KVStore:
 
     def close(self) -> None:
         with self._lock:
-            self.wal.close()
+            if self.wal is not None:
+                self.wal.close()
+            if self._lockfile is not None:
+                self._lockfile.release()
+
+    def _assert_writable(self) -> None:
+        if self.read_only:
+            raise StoreReadOnly(
+                f"data directory {self.data_dir!r} is opened read-only"
+            )
+        if self._lockfile is not None and self._lockfile.usurped:
+            raise DataDirLocked(
+                f"this store lost ownership of {self.data_dir!r}: another "
+                "store instance took over the directory in this process"
+            )
+
+    # ------------------------------------------------------------------ #
+    # Compaction
+    # ------------------------------------------------------------------ #
+    def compact(self) -> dict:
+        """Rewrite the WAL as a minimal snapshot (see ``compact.py``).
+
+        Manual trigger; also runs at startup when constructed with
+        ``compact_on_startup=True``. Observable state (values, versions,
+        TTLs, tombstones, capacity accounting) is identical before/after.
+        """
+        from .compact import LogCompactor
+
+        report = LogCompactor(self).compact()
+        self.last_compaction = report
+        return report
 
     # ------------------------------------------------------------------ #
     # Reads
@@ -193,10 +270,12 @@ class KVStore:
         expected_version: int | None = None,
         if_not_exists: bool = False,
     ) -> dict:
+        self._assert_writable()
         self._validate_name(namespace, "namespace")
         self._validate_name(key, "key")
         if ttl_ms is not None and (not isinstance(ttl_ms, int) or ttl_ms < 1):
             raise ValueError("ttl_ms must be a positive int or None")
+        self._ensure_serializable(value)
         result = self._commit([
             {
                 "op": "put",
@@ -211,12 +290,14 @@ class KVStore:
         return result["results"][0]
 
     def delete(self, namespace: str, key: str) -> dict:
+        self._assert_writable()
         self._validate_name(namespace, "namespace")
         self._validate_name(key, "key")
         result = self._commit([{"op": "delete", "namespace": namespace, "key": key}])
         return result["results"][0]
 
     def batch(self, mutations: list[dict]) -> dict:
+        self._assert_writable()
         if not isinstance(mutations, list) or not mutations:
             raise ValueError("batch requires a non-empty list of mutations")
         for m in mutations:
@@ -229,6 +310,8 @@ class KVStore:
             ttl = m.get("ttl_ms")
             if ttl is not None and (not isinstance(ttl, int) or ttl < 1):
                 raise ValueError("ttl_ms must be a positive int or None")
+            if m["op"] == "put":
+                self._ensure_serializable(m.get("value"))
         return self._commit(mutations)
 
     # ------------------------------------------------------------------ #
@@ -271,6 +354,10 @@ class KVStore:
                 raise
             for item in plan:
                 self._apply_staged(item)
+            if self._compaction_delta is not None:
+                # A compaction is copying a snapshot right now: mirror this
+                # confirmed mutation so it is carried into the new log.
+                self._compaction_delta.extend(plan)
             return {
                 "applied": True,
                 "atomic": atomic,
@@ -416,6 +503,19 @@ class KVStore:
             raise ValueError(f"{label} must be a non-empty string")
         if len(value) > 4096:
             raise ValueError(f"{label} too long (max 4096 chars)")
+
+    @staticmethod
+    def _ensure_serializable(value: object) -> None:
+        """Reject values the WAL cannot persist *before* any frame is written.
+
+        A failed write must leave zero trace: no partial frame, no dangling
+        transaction, no consumed sequence number — so later writes and the
+        next recovery stay continuous.
+        """
+        try:
+            json.dumps(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"value is not JSON-serializable: {exc}") from exc
 
     @staticmethod
     def _result_of(item: dict) -> dict:
