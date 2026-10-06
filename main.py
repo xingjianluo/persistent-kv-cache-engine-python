@@ -4,6 +4,8 @@ Environment variables
 ----------------------
 KV_DATA_DIR                 directory holding ``wal.log`` (default ./.kvdata)
 KV_CAPACITY_PER_NAMESPACE   max live keys per namespace (default 10000)
+KV_COMPACT_ON_START         "1" rewrites (compacts) the WAL during startup
+KV_READ_ONLY                "1" opens the store read-only (no lock, no writes)
 """
 
 from __future__ import annotations
@@ -21,7 +23,12 @@ from kvstore.store import KVStore
 def build_app() -> FastAPI:
     data_dir = os.environ.get("KV_DATA_DIR", ".kvdata")
     capacity = int(os.environ.get("KV_CAPACITY_PER_NAMESPACE", "10000"))
-    store = KVStore(data_dir=data_dir, capacity_per_namespace=capacity)
+    store = KVStore(
+        data_dir=data_dir,
+        capacity_per_namespace=capacity,
+        read_only=os.environ.get("KV_READ_ONLY", "") == "1",
+        compact_on_open=os.environ.get("KV_COMPACT_ON_START", "") == "1",
+    )
 
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI):

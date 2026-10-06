@@ -47,12 +47,27 @@ class CapacityExceeded(KVError):
     code = "capacity_exceeded"
 
 
+class LockHeld(KVError):
+    """The data directory is already opened by another writer process."""
+
+    code = "lock_held"
+
+
+class StoreReadOnly(KVError):
+    """A mutating operation was attempted on a read-only store."""
+
+    code = "read_only"
+
+
 class CorruptLogError(KVError):
     """WAL framing/checksum/structure is invalid.
 
     ``position`` is the byte offset at which corruption was detected and
     ``reason`` gives a stable sub-code (bad_magic, bad_crc, bad_length,
-    bad_payload, truncated_frame, nonempty_trailing_junk).
+    bad_payload, bad_sequence, truncated_frame, truncated_mid_log).
+    ``truncated_mid_log`` means an incomplete frame was found while valid
+    confirmed frames still follow it — genuine mid-log damage, reported
+    instead of truncated.
     """
 
     code = "corrupt_log"

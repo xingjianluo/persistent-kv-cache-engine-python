@@ -28,6 +28,7 @@ class OpCode(enum.Enum):
     DELETE = 2
     BEGIN = 3
     COMMIT = 4
+    META = 5  # log-generation header; only valid as the first frame (seq 0)
 
 
 @dataclass(frozen=True)

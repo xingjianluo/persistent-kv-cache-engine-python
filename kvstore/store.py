@@ -35,24 +35,29 @@ whose suffix is unconfirmed and is deterministically truncated on restart.
 
 from __future__ import annotations
 
+import json
+import os
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from .dirlock import DirLock
 from .errors import (
     CapacityExceeded,
     KeyDeleted,
     KeyExists,
     KeyExpired,
     KeyNotFound,
+    StoreReadOnly,
     TruncatedFrame,
     VersionMismatch,
 )
-from .records import DeleteRecord, OpCode, PutRecord
-from .wal import WriteAheadLog
+from .records import HEADER_SIZE, HEADER_STRUCT, DeleteRecord, OpCode, PutRecord
+from .wal import WriteAheadLog, encode_frame
 
 WAL_NAME = "wal.log"
+COMPACT_SUFFIX = ".compact"
 
 
 def _now_ms() -> int:
@@ -75,17 +80,37 @@ class KVStore:
         data_dir: str,
         capacity_per_namespace: int = 10_000,
         clock_ms: Callable[[], int] | None = None,
+        read_only: bool = False,
+        compact_on_open: bool = False,
     ):
         if capacity_per_namespace < 1:
             raise ValueError("capacity_per_namespace must be >= 1")
         self.data_dir = str(data_dir)
         self.capacity_per_namespace = capacity_per_namespace
         self.clock_ms = clock_ms or _now_ms
+        self.read_only = read_only
         # namespace -> key -> state
         self._tables: dict[str, dict[str, _State]] = {}
         self._lock = threading.RLock()
-        self.wal = WriteAheadLog(f"{self.data_dir.rstrip('/')}/{WAL_NAME}")
-        self.last_recovery = self.recover()
+        # A writer takes the directory lock for its whole lifetime so a
+        # second process cannot open the same data dir for writing; a
+        # read-only store never locks and never modifies the log.
+        self._dir_lock = None if read_only else DirLock(self.data_dir)
+        try:
+            wal_path = f"{self.data_dir.rstrip('/')}/{WAL_NAME}"
+            # A leftover compaction temp file means a crash happened before
+            # the atomic swap; the old log is still authoritative.
+            if not read_only and os.path.exists(wal_path + COMPACT_SUFFIX):
+                os.remove(wal_path + COMPACT_SUFFIX)
+            self.wal = WriteAheadLog(wal_path, read_only=read_only)
+            self.last_recovery = self.recover()
+            self.last_compaction = (
+                self.compact() if compact_on_open and not read_only else None
+            )
+        except BaseException:
+            if self._dir_lock is not None:
+                self._dir_lock.release()
+            raise
 
     # ------------------------------------------------------------------ #
     # Lifecycle / recovery
@@ -113,10 +138,15 @@ class KVStore:
                     )
 
             if truncation is not None:
-                self.wal.truncate_from(truncation.position)
-                frames, second = self.wal.recover()
-                if second is not None:  # pragma: no cover - defensive
-                    raise second
+                if self.read_only:
+                    # A read-only store reports the unconfirmed suffix but
+                    # never modifies the file; replay only confirmed frames.
+                    frames = [f for f in frames if f.offset < truncation.position]
+                else:
+                    self.wal.truncate_from(truncation.position)
+                    frames, second = self.wal.recover()
+                    if second is not None:  # pragma: no cover - defensive
+                        raise second
 
             self._tables = {}
             tx_records: list = []
@@ -165,6 +195,111 @@ class KVStore:
     def close(self) -> None:
         with self._lock:
             self.wal.close()
+            if self._dir_lock is not None:
+                self._dir_lock.release()
+                self._dir_lock = None
+
+    # ------------------------------------------------------------------ #
+    # Compaction
+    # ------------------------------------------------------------------ #
+    def compact(self) -> dict:
+        """Rewrite the WAL keeping only the current state of every key.
+
+        The compacted log starts a new *generation*: a META frame records
+        the first sequence number, then exactly one PUT/DELETE frame per
+        live key / tombstone, then any frames confirmed while the snapshot
+        was being written (renumbered, never dropped). Values, versions,
+        absolute TTL expiry and tombstones are preserved exactly, so
+        visibility reasons and versioned CAS behave identically afterwards.
+
+        Crash safety: the new log is written to ``wal.log.compact``, fsync'd
+        and atomically ``os.replace``d over the old one; a crash leaves
+        either the complete old log or the complete new one, and a leftover
+        temp file is discarded on the next open. Readers/writers are only
+        blocked during the in-memory snapshot and the final short swap.
+        """
+        if self.read_only:
+            raise StoreReadOnly("store is opened read-only; cannot compact")
+        with self._lock:
+            snapshot = {ns: dict(t) for ns, t in self._tables.items()}
+            base_seq = self.wal._next_seq
+            snapshot_offset = self.wal.size
+            bytes_before = snapshot_offset
+
+        entries = sorted(
+            (ns, key, st)
+            for ns, table in snapshot.items()
+            for key, st in table.items()
+        )
+        tmp_path = self.wal.path + COMPACT_SUFFIX
+        seq = base_seq
+        with open(tmp_path, "wb") as f:
+            f.write(encode_frame(OpCode.META, {"base_seq": base_seq}, 0))
+            for ns, key, st in entries:
+                f.write(encode_frame(*self._frame_for_state(ns, key, st), seq))
+                seq += 1
+            f.flush()
+            os.fsync(f.fileno())
+
+        with self._lock:
+            # Frames confirmed while the snapshot was being written must not
+            # be lost: copy them over, renumbered onto the new generation.
+            delta_frames = 0
+            with open(self.wal.path, "rb") as old:
+                old.seek(snapshot_offset)
+                delta = old.read()
+            pos = 0
+            with open(tmp_path, "ab") as f:
+                while pos + HEADER_SIZE <= len(delta):
+                    _magic, plen, _crc, _s, op_byte = HEADER_STRUCT.unpack_from(
+                        delta, pos
+                    )
+                    end = pos + HEADER_SIZE + plen
+                    if end > len(delta):
+                        break  # pragma: no cover - cannot happen under the lock
+                    payload = delta[pos + HEADER_SIZE : end]
+                    f.write(encode_frame(OpCode(op_byte), json.loads(payload), seq))
+                    seq += 1
+                    delta_frames += 1
+                    pos = end
+                f.flush()
+                os.fsync(f.fileno())
+            self.wal.close()
+            os.replace(tmp_path, self.wal.path)
+            dir_fd = os.open(self.data_dir, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+            self.wal = WriteAheadLog(self.wal.path)
+            self.wal._resync_next_seq()
+            report = {
+                "compacted": True,
+                "entries": len(entries),
+                "delta_frames": delta_frames,
+                "base_seq": base_seq,
+                "next_seq": seq,
+                "bytes_before": bytes_before,
+                "bytes_after": self.wal.size,
+            }
+            self.last_compaction = report
+            return report
+
+    @staticmethod
+    def _frame_for_state(ns: str, key: str, st: _State):
+        if st.deleted:
+            return OpCode.DELETE, {
+                "namespace": ns,
+                "key": key,
+                "version": st.version,
+            }
+        return OpCode.PUT, {
+            "namespace": ns,
+            "key": key,
+            "value": st.value,
+            "version": st.version,
+            "expires_at_ms": st.expires_at_ms,
+        }
 
     # ------------------------------------------------------------------ #
     # Reads
@@ -235,6 +370,8 @@ class KVStore:
     # Core: stage -> validate -> persist -> apply
     # ------------------------------------------------------------------ #
     def _commit(self, mutations: list[dict]) -> dict:
+        if self.read_only:
+            raise StoreReadOnly("store is opened read-only; writes are disabled")
         atomic = len(mutations) > 1
         with self._lock:
             now = self.clock_ms()

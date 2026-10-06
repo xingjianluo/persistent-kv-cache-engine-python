@@ -32,6 +32,8 @@ _STATUS_BY_CODE = {
     "version_mismatch": 409,
     "key_exists": 409,
     "capacity_exceeded": 507,
+    "lock_held": 409,
+    "read_only": 409,
     "corrupt_log": 500,
     "truncated_frame": 500,
 }
@@ -126,5 +128,13 @@ def create_app(store: KVStore, lifespan=None) -> FastAPI:
     @app.get("/v1/admin/recovery-report")
     def recovery_report():
         return store.last_recovery
+
+    @app.post("/v1/admin/compact")
+    def compact():
+        return store.compact()
+
+    @app.get("/v1/admin/compaction-report")
+    def compaction_report():
+        return {"last_compaction": store.last_compaction}
 
     return app
